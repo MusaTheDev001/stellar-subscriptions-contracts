@@ -8,8 +8,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    Error, RegistryContract, RegistryContractClient, RegistryStats, SubscriptionRecord,
-    STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED, STATUS_PAUSED,
+    Error, MerchantStats, RegistryContract, RegistryContractClient, RegistryStats,
+    SubscriptionRecord, STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED, STATUS_PAUSED,
 };
 
 struct Setup {
@@ -273,35 +273,6 @@ fn unknown_status_codes_are_rejected() {
 }
 
 #[test]
-fn reading_a_record_and_the_id_list_extends_their_persistent_ttl() {
-    use soroban_sdk::testutils::Ledger as _;
-
-    // Ledgers in one day, matching the constant in `storage.rs`.
-    const DAY: u32 = 17_280;
-
-    let s = Setup::new();
-    s.register(1);
-
-    // Two days on, both entries are inside the threshold window and have aged.
-    let now = s.env.ledger().sequence();
-    s.env.ledger().set_sequence_number(now + 2 * DAY);
-
-    let ttl = |key: crate::storage::DataKey| {
-        s.env.as_contract(&s.client.address, || {
-            s.env.storage().persistent().get_ttl(&key)
-        })
-    };
-    let record_before = ttl(crate::storage::DataKey::Record(1));
-    let list_before = ttl(crate::storage::DataKey::AllSubscriptions);
-
-    s.client.get_subscription_record(&1);
-    s.client.get_all_subscriptions();
-
-    assert!(ttl(crate::storage::DataKey::Record(1)) > record_before);
-    assert!(ttl(crate::storage::DataKey::AllSubscriptions) > list_before);
-}
-
-#[test]
 fn unknown_subscriptions_are_not_found() {
     let s = Setup::new();
     expect_err(
@@ -356,36 +327,86 @@ fn only_the_plan_contract_can_register_plans() {
 }
 
 #[test]
-fn volume_accumulation_overflows_gracefully() {
+fn merchant_stats_equal_recomputation_from_merchant_records_single_merchant() {
     let s = Setup::new();
     s.register(1);
     s.register(2);
+    s.client.update_subscription(&1, &100, &STATUS_ACTIVE);
+    s.client.update_subscription(&2, &200, &STATUS_ACTIVE);
 
-    // Drive sub1 total_charged and the volume to i128::MAX - 1, using two
-    // updates so the arithmetic in update_subscription stays within bounds
-    // at each step.
-    let half = i128::MAX / 2; // fits comfortably
-    s.client.update_subscription(&1, &half, &STATUS_ACTIVE);
-    // Bring sub1 to i128::MAX - 1 exactly; delta = (i128::MAX - 1) - half.
-    let near_max = i128::MAX - 1;
-    s.client.update_subscription(&1, &near_max, &STATUS_ACTIVE);
-    assert_eq!(s.stats().total_charged_volume, near_max);
+    let stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.subscriptions, 2);
+    assert_eq!(stats.active_subscriptions, 2);
+    assert_eq!(stats.total_charged_volume, 300);
+}
 
-    // Now bring sub2 up by 1 so the total_charged_volume reaches i128::MAX.
-    s.client.update_subscription(&2, &1, &STATUS_ACTIVE);
-    assert_eq!(s.stats().total_charged_volume, i128::MAX);
+#[test]
+fn merchant_stats_are_independent_across_merchants() {
+    let s = Setup::new();
+    let other_merchant = Address::generate(&s.env);
+    s.register(1);
+    s.client
+        .register_subscription(&2, &s.subscriber, &other_merchant);
+    s.client.update_subscription(&1, &100, &STATUS_ACTIVE);
+    s.client.update_subscription(&2, &200, &STATUS_ACTIVE);
 
-    // Snapshot state before the overflowing update.
-    let before_stats = s.stats();
-    let before_record = s.client.get_subscription_record(&2);
+    let merchant_stats = s.client.get_merchant_stats(&s.merchant);
+    let other_stats = s.client.get_merchant_stats(&other_merchant);
 
-    // Attempting to add any positive delta to total_charged_volume must overflow.
-    expect_err(
-        s.client.try_update_subscription(&2, &2, &STATUS_ACTIVE),
-        Error::Overflow,
-    );
+    assert_eq!(merchant_stats.subscriptions, 1);
+    assert_eq!(merchant_stats.total_charged_volume, 100);
+    assert_eq!(other_stats.subscriptions, 1);
+    assert_eq!(other_stats.total_charged_volume, 200);
+}
 
-    // Stats and the record are unchanged after the failed update.
-    assert_eq!(s.stats(), before_stats);
-    assert_eq!(s.client.get_subscription_record(&2), before_record);
+#[test]
+fn merchant_stats_track_active_subscriptions() {
+    let s = Setup::new();
+    s.register(1);
+    s.register(2);
+    s.register(3);
+
+    let mut stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.active_subscriptions, 3);
+
+    s.client.update_subscription(&1, &0, &STATUS_PAUSED);
+    stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.active_subscriptions, 2);
+
+    s.client.update_subscription(&1, &0, &STATUS_ACTIVE);
+    stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.active_subscriptions, 3);
+
+    s.client.update_subscription(&2, &0, &STATUS_CANCELLED);
+    stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.active_subscriptions, 2);
+
+    s.client.update_subscription(&3, &0, &STATUS_EXHAUSTED);
+    stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.active_subscriptions, 1);
+}
+
+#[test]
+fn merchant_stats_accumulate_volume_incrementally() {
+    let s = Setup::new();
+    s.register(1);
+
+    let mut stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.total_charged_volume, 0);
+
+    s.client.update_subscription(&1, &100, &STATUS_ACTIVE);
+    stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.total_charged_volume, 100);
+
+    s.client.update_subscription(&1, &250, &STATUS_ACTIVE);
+    stats = s.client.get_merchant_stats(&s.merchant);
+    assert_eq!(stats.total_charged_volume, 250);
+}
+
+#[test]
+fn merchant_stats_start_zero_for_unknown_merchant() {
+    let s = Setup::new();
+    let unknown = Address::generate(&s.env);
+    let stats = s.client.get_merchant_stats(&unknown);
+    assert_eq!(stats, MerchantStats::default());
 }

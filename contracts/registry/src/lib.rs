@@ -16,8 +16,8 @@ mod types;
 
 pub use errors::Error;
 pub use types::{
-    RegistryStats, SubscriptionRecord, Writers, STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED,
-    STATUS_PAUSED,
+    MerchantStats, RegistryStats, SubscriptionRecord, Writers, STATUS_ACTIVE, STATUS_CANCELLED,
+    STATUS_EXHAUSTED, STATUS_PAUSED,
 };
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
@@ -89,7 +89,6 @@ impl RegistryContract {
         subscription_id: u64,
         subscriber: Address,
         merchant: Address,
-        token: Address,
     ) -> Result<(), Error> {
         storage::read_writers(&env)?
             .subscription_contract
@@ -103,8 +102,7 @@ impl RegistryContract {
             &SubscriptionRecord {
                 id: subscription_id,
                 subscriber,
-                merchant,
-                token,
+                merchant: merchant.clone(),
                 total_charged: 0,
                 status: STATUS_ACTIVE,
             },
@@ -121,6 +119,18 @@ impl RegistryContract {
             .checked_add(1)
             .ok_or(Error::Overflow)?;
         storage::write_stats(&env, &stats);
+
+        let mut merchant_stats = storage::read_merchant_stats(&env, &merchant);
+        merchant_stats.subscriptions = merchant_stats
+            .subscriptions
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        merchant_stats.active_subscriptions = merchant_stats
+            .active_subscriptions
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        storage::write_merchant_stats(&env, &merchant, &merchant_stats);
+
         storage::bump_instance(&env);
         Ok(())
     }
@@ -174,16 +184,39 @@ impl RegistryContract {
                 .ok_or(Error::Overflow)?;
         }
 
+        let mut merchant_stats = storage::read_merchant_stats(&env, &record.merchant);
+        merchant_stats.total_charged_volume = merchant_stats
+            .total_charged_volume
+            .checked_add(delta)
+            .ok_or(Error::Overflow)?;
+        if was_active && !is_active {
+            merchant_stats.active_subscriptions = merchant_stats
+                .active_subscriptions
+                .checked_sub(1)
+                .ok_or(Error::Overflow)?;
+        } else if !was_active && is_active {
+            merchant_stats.active_subscriptions = merchant_stats
+                .active_subscriptions
+                .checked_add(1)
+                .ok_or(Error::Overflow)?;
+        }
+
         record.total_charged = total_charged;
         record.status = status;
         storage::write_record(&env, &record);
         storage::write_stats(&env, &stats);
+        storage::write_merchant_stats(&env, &record.merchant, &merchant_stats);
         storage::bump_instance(&env);
         Ok(())
     }
 
     pub fn get_stats(env: Env) -> RegistryStats {
         storage::read_stats(&env)
+    }
+
+    /// Get per-merchant stats.
+    pub fn get_merchant_stats(env: Env, merchant: Address) -> MerchantStats {
+        storage::read_merchant_stats(&env, &merchant)
     }
 
     pub fn get_subscription_record(
@@ -207,19 +240,6 @@ impl RegistryContract {
             }
         }
         Ok(out)
-    }
-
-    /// Total volume charged for a specific token. Sums `total_charged` across
-    /// all subscriptions using that token, regardless of status.
-    pub fn get_token_volume(env: Env, token: Address) -> Result<i128, Error> {
-        let mut volume = 0i128;
-        for id in storage::read_all_ids(&env).iter() {
-            let record = storage::read_record(&env, id)?;
-            if record.token == token {
-                volume = volume.checked_add(record.total_charged).ok_or(Error::Overflow)?;
-            }
-        }
-        Ok(volume)
     }
 }
 
