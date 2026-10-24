@@ -15,7 +15,7 @@ mod types;
 pub use errors::Error;
 pub use types::{SubStatus, Subscription};
 
-use events::{Cancelled, CapLowered, Charged, Paused, Resumed, Subscribed};
+use events::{Cancelled, Charged, MerchantEnded, Paused, Resumed, Subscribed};
 use interfaces::{PlanClient, RegistryClient};
 use soroban_sdk::{contract, contractimpl, token::TokenClient, Address, Env, Vec};
 use storage::DataKey;
@@ -78,19 +78,15 @@ impl SubscriptionContract {
         storage::read_registry(&env)
     }
 
-    /// Get the admin address.
-    pub fn get_admin(env: Env) -> Result<Address, Error> {
-        storage::read_admin(&env)
-    }
-
     /// Subscriber authorizes a subscription. This is where consent is granted
     /// and bounded: the merchant may later pull `amount_per_period` once per
     /// `interval_ledgers`, never more than `total_cap` in total.
     ///
     /// A non-zero `plan_id` must name an active plan whose merchant, token,
     /// amount and interval match exactly; 0 creates an ad-hoc subscription.
-    /// The first charge is available immediately. Also approves this contract
-    /// to spend the subscriber's outstanding cap in `token`.
+    /// The first charge is available after `trial_ledgers` (immediately if 0).
+    /// Also approves this contract to spend the subscriber's outstanding cap in
+    /// `token`.
     #[allow(clippy::too_many_arguments)]
     pub fn subscribe(
         env: Env,
@@ -101,6 +97,7 @@ impl SubscriptionContract {
         interval_ledgers: u32,
         total_cap: i128,
         plan_id: u64,
+        trial_ledgers: u32,
     ) -> Result<u64, Error> {
         storage::read_admin(&env)?;
         subscriber.require_auth();
@@ -130,6 +127,9 @@ impl SubscriptionContract {
 
         let id = storage::take_next_id(&env)?;
         let now = env.ledger().sequence();
+        let next_charge_ledger = now
+            .checked_add(trial_ledgers)
+            .ok_or(Error::Overflow)?;
         let sub = Subscription {
             id,
             subscriber,
@@ -141,9 +141,10 @@ impl SubscriptionContract {
             total_charged: 0,
             start_ledger: now,
             last_charge_ledger: 0,
-            next_charge_ledger: now,
+            next_charge_ledger,
             status: SubStatus::Active,
             plan_id,
+            trial_ledgers,
         };
         storage::write_sub(&env, &sub);
         storage::push_index(&env, DataKey::BySubscriber(sub.subscriber.clone()), id);
@@ -157,7 +158,6 @@ impl SubscriptionContract {
                 &id,
                 &sub.subscriber,
                 &sub.merchant,
-                &sub.token,
             );
             if !matches!(registered, Ok(Ok(()))) {
                 return Err(Error::RegistryUpdateFailed);
@@ -204,6 +204,7 @@ impl SubscriptionContract {
             SubStatus::Paused => return Err(Error::SubscriptionPaused),
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
+            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         // INTERVAL.
@@ -252,7 +253,6 @@ impl SubscriptionContract {
         Charged {
             subscription_id,
             merchant: sub.merchant,
-            token: sub.token,
             amount: sub.amount_per_period,
             total_charged: sub.total_charged,
             next_charge_ledger: sub.next_charge_ledger,
@@ -275,6 +275,7 @@ impl SubscriptionContract {
             SubStatus::Active | SubStatus::Paused => {}
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
+            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         sub.status = SubStatus::Cancelled;
@@ -309,6 +310,7 @@ impl SubscriptionContract {
             SubStatus::Paused => return Err(Error::AlreadyPaused),
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
+            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         sub.status = SubStatus::Paused;
@@ -336,6 +338,7 @@ impl SubscriptionContract {
             SubStatus::Active => return Err(Error::NotPaused),
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
+            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         let now = env.ledger().sequence();
@@ -353,47 +356,32 @@ impl SubscriptionContract {
         Ok(())
     }
 
-    /// Subscriber lowers a subscription's cap. Cannot raise it, only lower.
-    /// The cap can never be lowered below the amount already charged.
-    ///
-    /// Allowed from any status. The new cap is enforced in `charge` regardless
-    /// of status. Lowering the token allowance and updating the registry
-    /// happen afterwards as clean-up.
-    pub fn lower_cap(
-        env: Env,
-        subscriber: Address,
-        subscription_id: u64,
-        new_cap: i128,
-    ) -> Result<(), Error> {
-        let mut sub = Self::load_for_subscriber(&env, &subscriber, subscription_id)?;
-
-        // Cannot raise the cap, only lower it.
-        if new_cap > sub.total_cap {
-            return Err(Error::CapCannotRaise);
+    /// Merchant ends a subscription, stopping future charges. The subscription
+    /// status becomes `MerchantEnded`, which is final. The subscriber can still
+    /// cancel to release their token allowance. The registry is notified of the
+    /// change.
+    pub fn merchant_end(env: Env, merchant: Address, subscription_id: u64) -> Result<(), Error> {
+        merchant.require_auth();
+        let mut sub = storage::read_sub(&env, subscription_id)?;
+        if sub.merchant != merchant {
+            return Err(Error::NotMerchant);
         }
 
-        // Cannot lower below what's already charged.
-        if new_cap < sub.total_charged {
-            return Err(Error::CapBelowCharged);
+        match sub.status {
+            SubStatus::Active | SubStatus::Paused => {}
+            SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
+            SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
+            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
-        sub.total_cap = new_cap;
+        sub.status = SubStatus::MerchantEnded;
         storage::write_sub(&env, &sub);
-
-        // Lowering the cap may reduce the allowance; recompute from the new
-        // contract state.
-        let _allowance_updated = allowance::sync(&env, &sub.subscriber, &sub.token).is_ok();
-        let _registry_updated = Self::report(&env, &sub).is_ok();
-
+        Self::report(&env, &sub)?;
         storage::bump_instance(&env);
-        let new_remaining = new_cap
-            .checked_sub(sub.total_charged)
-            .ok_or(Error::Overflow)?;
-        CapLowered {
+        MerchantEnded {
             subscription_id,
-            subscriber,
-            new_cap,
-            new_remaining,
+            merchant: sub.merchant,
+            total_charged: sub.total_charged,
         }
         .publish(&env);
         Ok(())
@@ -457,6 +445,63 @@ impl SubscriptionContract {
             .ok_or(Error::Overflow)
     }
 
+    /// Number of whole periods the subscription's cap still allows to be
+    /// charged. Returns 0 for final states (Cancelled, Exhausted, or
+    /// MerchantEnded).
+    pub fn charges_remaining(env: Env, subscription_id: u64) -> Result<i128, Error> {
+        let sub = storage::read_sub(&env, subscription_id)?;
+        if sub.status.is_final() {
+            return Ok(0);
+        }
+        let remaining_cap = sub
+            .total_cap
+            .checked_sub(sub.total_charged)
+            .ok_or(Error::Overflow)?;
+        Ok(remaining_cap / sub.amount_per_period)
+    }
+
+    /// Ledgers until the next charge may succeed. Returns 0 if a charge is
+    /// allowed right now. Returns 0 for final states even if the schedule
+    /// suggests otherwise.
+    pub fn next_charge_in(env: Env, subscription_id: u64) -> Result<u32, Error> {
+        let sub = storage::read_sub(&env, subscription_id)?;
+        if sub.status.is_final() {
+            return Ok(0);
+        }
+        let now = env.ledger().sequence();
+        if now >= sub.next_charge_ledger {
+            return Ok(0);
+        }
+        Ok(sub
+            .next_charge_ledger
+            .checked_sub(now)
+            .ok_or(Error::Overflow)?)
+    }
+
+    /// Token allowance status for a subscriber. Returns the outstanding cap
+    /// (sum of remaining caps across non-final subscriptions) and the current
+    /// allowance granted to this contract.
+    ///
+    /// Note: The expiry ledger of the allowance cannot be reliably determined
+    /// from the Soroban token interface. Callers should track allowance expiry
+    /// through events or refresh the allowance periodically via
+    /// `refresh_allowance`.
+    pub fn get_allowance_status(
+        env: Env,
+        subscriber: Address,
+        token: Address,
+    ) -> Result<(i128, i128), Error> {
+        let outstanding = allowance::outstanding(&env, &subscriber, &token)?;
+        let spender = env.current_contract_address();
+        let current_allowance = match soroban_sdk::token::TokenClient::new(&env, &token)
+            .try_allowance(&subscriber, &spender)
+        {
+            Ok(Ok(amount)) => amount,
+            _ => 0,
+        };
+        Ok((outstanding, current_allowance))
+    }
+
     /// Every subscription a subscriber has created, oldest first.
     pub fn get_by_subscriber(env: Env, subscriber: Address) -> Result<Vec<Subscription>, Error> {
         Self::load_indexed(&env, &DataKey::BySubscriber(subscriber))
@@ -465,81 +510,6 @@ impl SubscriptionContract {
     /// Every subscription payable to a merchant, oldest first.
     pub fn get_by_merchant(env: Env, merchant: Address) -> Result<Vec<Subscription>, Error> {
         Self::load_indexed(&env, &DataKey::ByMerchant(merchant))
-    }
-
-    /// Cancel all open subscriptions for a subscriber in a given token, with
-    /// work-bounding for scalability. Each call processes up to 10
-    /// subscriptions.
-    ///
-    /// Requires the subscriber's signature. Subscriptions that are already
-    /// Cancelled or Exhausted are skipped. Returns (count_processed, has_more).
-    /// If `has_more` is true, call again with the same parameters to continue.
-    /// The order is stable, so you can call repeatedly until all are done.
-    ///
-    /// This function reuses the single-cancel logic, so REVOCATION is enforced
-    /// uniformly: no updates to a final subscription ever happen, and the
-    /// allowance and registry follow the main status update, with failures
-    /// not blocking the cancellation.
-    pub fn cancel_all(
-        env: Env,
-        subscriber: Address,
-        token: Address,
-    ) -> Result<(u64, bool), Error> {
-        const WORK_LIMIT: u32 = 10;
-
-        subscriber.require_auth();
-        let all_subs = Self::load_indexed(&env, &DataKey::BySubscriber(subscriber.clone()))?;
-
-        let mut count = 0u64;
-        let mut found_one = false;
-
-        for sub_id in all_subs.iter() {
-            if count >= WORK_LIMIT as u64 {
-                break;
-            }
-
-            let sub = storage::read_sub(&env, sub_id)?;
-
-            // Only process subscriptions for this token
-            if sub.token != token {
-                continue;
-            }
-
-            // Skip already final subscriptions
-            if sub.status.is_final() {
-                continue;
-            }
-
-            found_one = true;
-
-            // Perform cancellation. We inline the core logic here to avoid
-            // re-auth, since the subscriber already authorized at the top.
-            let mut mut_sub = sub;
-            mut_sub.status = SubStatus::Cancelled;
-            storage::write_sub(&env, &mut_sub);
-
-            // Clean up allowance and registry, but don't fail the cancellation
-            // if they fail. Report the outcome in the event.
-            let allowance_updated = allowance::sync(&env, &mut_sub.subscriber, &mut_sub.token).is_ok();
-            let registry_updated = Self::report(&env, &mut_sub).is_ok();
-
-            Cancelled {
-                subscription_id: sub_id,
-                subscriber: mut_sub.subscriber.clone(),
-                total_charged: mut_sub.total_charged,
-                unused_cap: mut_sub.total_cap.saturating_sub(mut_sub.total_charged),
-                allowance_updated,
-                registry_updated,
-            }
-            .publish(&env);
-
-            count += 1;
-        }
-
-        storage::bump_instance(&env);
-
-        let has_more = found_one && count >= WORK_LIMIT as u64;
-        Ok((count, has_more))
     }
 
     // ---- internal helpers ----

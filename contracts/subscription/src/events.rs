@@ -31,7 +31,6 @@ pub struct Charged {
     pub subscription_id: u64,
     #[topic]
     pub merchant: Address,
-    pub token: Address,
     pub amount: i128,
     pub total_charged: i128,
     pub next_charge_ledger: u32,
@@ -92,15 +91,13 @@ pub struct Resumed {
     pub next_charge_ledger: u32,
 }
 
-/// A subscriber lowered a subscription's cap.
+/// A merchant ended a subscription. Final.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapLowered {
+pub struct MerchantEnded {
     #[topic]
     pub subscription_id: u64,
     #[topic]
-    pub subscriber: Address,
-    pub new_cap: i128,
-    /// Cap that can still ever be charged after the lowering.
-    pub new_remaining: i128,
+    pub merchant: Address,
+    pub total_charged: i128,
 }
