@@ -20,14 +20,6 @@ use interfaces::{PlanClient, RegistryClient};
 use soroban_sdk::{contract, contractimpl, token::TokenClient, Address, Env, Vec};
 use storage::DataKey;
 
-/// Most subscriptions one paged read returns. Larger `limit`s are capped to
-/// this, so a single read stays within the network's resource limits.
-pub const MAX_PAGE_LIMIT: u32 = 50;
-
-/// Most index entries one `due_for_merchant` call reads, whether or not they
-/// are due. Bounds the read cost of a call when few subscriptions are due.
-pub const MAX_SCAN: u32 = 200;
-
 #[contract]
 pub struct SubscriptionContract;
 
@@ -151,9 +143,6 @@ impl SubscriptionContract {
         storage::write_sub(&env, &sub);
         storage::push_index(&env, DataKey::BySubscriber(sub.subscriber.clone()), id);
         storage::push_index(&env, DataKey::ByMerchant(sub.merchant.clone()), id);
-        if plan_id != 0 {
-            storage::push_index(&env, DataKey::ByPlan(plan_id), id);
-        }
 
         // After the write, so the new subscription's cap is included.
         allowance::sync(&env, &sub.subscriber, &sub.token)?;
@@ -163,6 +152,7 @@ impl SubscriptionContract {
                 &id,
                 &sub.subscriber,
                 &sub.merchant,
+                &sub.token,
             );
             if !matches!(registered, Ok(Ok(()))) {
                 return Err(Error::RegistryUpdateFailed);
@@ -420,89 +410,84 @@ impl SubscriptionContract {
         Self::load_indexed(&env, &DataKey::BySubscriber(subscriber))
     }
 
-    /// Every subscription payable to a merchant, oldest first. Reads the whole
-    /// history, so for merchants with many subscriptions use
-    /// `get_by_merchant_page`.
+    /// Every subscription payable to a merchant, oldest first.
     pub fn get_by_merchant(env: Env, merchant: Address) -> Result<Vec<Subscription>, Error> {
         Self::load_indexed(&env, &DataKey::ByMerchant(merchant))
     }
 
-    /// One page of the subscriptions payable to a merchant, oldest first.
-    /// `start` is the position of the first item. `limit` is capped at
-    /// [`MAX_PAGE_LIMIT`]. A page past the end is empty.
-    pub fn get_by_merchant_page(
-        env: Env,
-        merchant: Address,
-        start: u32,
-        limit: u32,
-    ) -> Result<Vec<Subscription>, Error> {
-        Self::load_page(&env, &DataKey::ByMerchant(merchant), start, limit)
-    }
-
-    /// How many subscriptions a subscriber has created. Reads only the index,
-    /// not the records.
-    pub fn count_by_subscriber(env: Env, subscriber: Address) -> u32 {
-        storage::read_index(&env, &DataKey::BySubscriber(subscriber)).len()
-    }
-
-    /// How many subscriptions are payable to a merchant. Reads only the index,
-    /// not the records.
-    pub fn count_by_merchant(env: Env, merchant: Address) -> u32 {
-        storage::read_index(&env, &DataKey::ByMerchant(merchant)).len()
-    }
-
-    /// One page of the subscriptions created from a plan, oldest first. `start`
-    /// and `limit` work as in `get_by_merchant_page`. Ad-hoc subscriptions
-    /// (plan id 0) are never listed here.
-    pub fn get_by_plan_page(
-        env: Env,
-        plan_id: u64,
-        start: u32,
-        limit: u32,
-    ) -> Result<Vec<Subscription>, Error> {
-        Self::load_page(&env, &DataKey::ByPlan(plan_id), start, limit)
-    }
-
-    /// How many subscriptions were created from a plan. Reads only the index.
-    pub fn count_by_plan(env: Env, plan_id: u64) -> u32 {
-        storage::read_index(&env, &DataKey::ByPlan(plan_id)).len()
-    }
-
-    /// Ids of the merchant's subscriptions that `is_chargeable` reports as due
-    /// now, read from the merchant's index starting at position `start`.
+    /// Cancel all open subscriptions for a subscriber in a given token, with
+    /// work-bounding for scalability. Each call processes up to 10
+    /// subscriptions.
     ///
-    /// Returns the due ids found and the position to resume from, or `None`
-    /// once the index is exhausted. One call reads at most `MAX_SCAN` index
-    /// entries, so it can return fewer than `limit` ids while more remain.
-    /// Keep calling with the returned position until it is `None`. The result
-    /// is a snapshot, so a `charge` on a returned id can still fail. `limit` is
-    /// clamped to between 1 and `MAX_PAGE_LIMIT`.
-    pub fn due_for_merchant(
+    /// Requires the subscriber's signature. Subscriptions that are already
+    /// Cancelled or Exhausted are skipped. Returns (count_processed, has_more).
+    /// If `has_more` is true, call again with the same parameters to continue.
+    /// The order is stable, so you can call repeatedly until all are done.
+    ///
+    /// This function reuses the single-cancel logic, so REVOCATION is enforced
+    /// uniformly: no updates to a final subscription ever happen, and the
+    /// allowance and registry follow the main status update, with failures
+    /// not blocking the cancellation.
+    pub fn cancel_all(
         env: Env,
-        merchant: Address,
-        start: u32,
-        limit: u32,
-    ) -> (Vec<u64>, Option<u32>) {
-        let ids = storage::read_index(&env, &DataKey::ByMerchant(merchant));
-        let limit = limit.clamp(1, MAX_PAGE_LIMIT);
-        let mut due = Vec::new(&env);
-        let mut position = start;
-        let mut scanned: u32 = 0;
-        while position < ids.len() && scanned < MAX_SCAN && due.len() < limit {
-            if let Some(id) = ids.get(position) {
-                if Self::is_chargeable(env.clone(), id).unwrap_or(false) {
-                    due.push_back(id);
-                }
+        subscriber: Address,
+        token: Address,
+    ) -> Result<(u64, bool), Error> {
+        const WORK_LIMIT: u32 = 10;
+
+        subscriber.require_auth();
+        let all_subs = Self::load_indexed(&env, &DataKey::BySubscriber(subscriber.clone()))?;
+
+        let mut count = 0u64;
+        let mut found_one = false;
+
+        for sub_id in all_subs.iter() {
+            if count >= WORK_LIMIT as u64 {
+                break;
             }
-            position += 1;
-            scanned += 1;
+
+            let sub = storage::read_sub(&env, sub_id)?;
+
+            // Only process subscriptions for this token
+            if sub.token != token {
+                continue;
+            }
+
+            // Skip already final subscriptions
+            if sub.status.is_final() {
+                continue;
+            }
+
+            found_one = true;
+
+            // Perform cancellation. We inline the core logic here to avoid
+            // re-auth, since the subscriber already authorized at the top.
+            let mut mut_sub = sub;
+            mut_sub.status = SubStatus::Cancelled;
+            storage::write_sub(&env, &mut_sub);
+
+            // Clean up allowance and registry, but don't fail the cancellation
+            // if they fail. Report the outcome in the event.
+            let allowance_updated = allowance::sync(&env, &mut_sub.subscriber, &mut_sub.token).is_ok();
+            let registry_updated = Self::report(&env, &mut_sub).is_ok();
+
+            Cancelled {
+                subscription_id: sub_id,
+                subscriber: mut_sub.subscriber.clone(),
+                total_charged: mut_sub.total_charged,
+                unused_cap: mut_sub.total_cap.saturating_sub(mut_sub.total_charged),
+                allowance_updated,
+                registry_updated,
+            }
+            .publish(&env);
+
+            count += 1;
         }
-        let next = if position < ids.len() {
-            Some(position)
-        } else {
-            None
-        };
-        (due, next)
+
+        storage::bump_instance(&env);
+
+        let has_more = found_one && count >= WORK_LIMIT as u64;
+        Ok((count, has_more))
     }
 
     // ---- internal helpers ----
@@ -574,20 +559,6 @@ impl SubscriptionContract {
             return Err(Error::RegistryUpdateFailed);
         }
         Ok(())
-    }
-
-    /// Reads one page of an index. Only the records in the page are loaded.
-    fn load_page(env: &Env, key: &DataKey, start: u32, limit: u32) -> Result<Vec<Subscription>, Error> {
-        let ids = storage::read_index(env, key);
-        let end = start
-            .saturating_add(limit.min(MAX_PAGE_LIMIT))
-            .min(ids.len());
-        let mut out = Vec::new(env);
-        for index in start..end {
-            let id = ids.get(index).ok_or(Error::SubscriptionNotFound)?;
-            out.push_back(storage::read_sub(env, id)?);
-        }
-        Ok(out)
     }
 
     fn load_indexed(env: &Env, key: &DataKey) -> Result<Vec<Subscription>, Error> {

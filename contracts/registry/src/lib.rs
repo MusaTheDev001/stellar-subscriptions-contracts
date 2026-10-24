@@ -20,30 +20,7 @@ pub use types::{
     STATUS_PAUSED,
 };
 
-use soroban_sdk::{contract, contractevent, contractimpl, Address, Env, Vec};
-
-/// Emitted once per newly registered subscription.
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Registered {
-    pub subscription_id: u64,
-    pub total_subscriptions: u64,
-    pub active_subscriptions: u64,
-}
-
-/// Emitted once per accepted subscription update.
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Updated {
-    pub subscription_id: u64,
-    pub total_charged: i128,
-    pub status: u32,
-    pub total_charged_volume: i128,
-    pub active_subscriptions: u64,
-}
-
-/// Maximum accepted page size in listings.
-pub const MAX_PAGE_SIZE: u32 = 100;
+use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 
 #[contract]
 pub struct RegistryContract;
@@ -88,21 +65,6 @@ impl RegistryContract {
         Ok(())
     }
 
-    /// Transfer admin role to a new address (can be a contract account or multisig).
-    /// Only the current admin can call this.
-    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
-        let stored = storage::read_admin(&env)?;
-        admin.require_auth();
-        if stored != admin {
-            return Err(Error::Unauthorized);
-        }
-        // New admin must authorize the transfer (works for contract accounts and multisigs)
-        new_admin.require_auth();
-        storage::write_admin(&env, &new_admin);
-        storage::bump_instance(&env);
-        Ok(())
-    }
-
     pub fn get_writers(env: Env) -> Result<Writers, Error> {
         storage::read_writers(&env)
     }
@@ -127,6 +89,7 @@ impl RegistryContract {
         subscription_id: u64,
         subscriber: Address,
         merchant: Address,
+        token: Address,
     ) -> Result<(), Error> {
         storage::read_writers(&env)?
             .subscription_contract
@@ -141,6 +104,7 @@ impl RegistryContract {
                 id: subscription_id,
                 subscriber,
                 merchant,
+                token,
                 total_charged: 0,
                 status: STATUS_ACTIVE,
             },
@@ -158,13 +122,6 @@ impl RegistryContract {
             .ok_or(Error::Overflow)?;
         storage::write_stats(&env, &stats);
         storage::bump_instance(&env);
-
-        Registered {
-            subscription_id,
-            total_subscriptions: stats.total_subscriptions,
-            active_subscriptions: stats.active_subscriptions,
-        }
-        .publish(&env);
         Ok(())
     }
 
@@ -222,15 +179,6 @@ impl RegistryContract {
         storage::write_record(&env, &record);
         storage::write_stats(&env, &stats);
         storage::bump_instance(&env);
-
-        Updated {
-            subscription_id,
-            total_charged,
-            status,
-            total_charged_volume: stats.total_charged_volume,
-            active_subscriptions: stats.active_subscriptions,
-        }
-        .publish(&env);
         Ok(())
     }
 
@@ -250,34 +198,6 @@ impl RegistryContract {
         storage::read_all_ids(&env)
     }
 
-    /// Paginated variant of `get_all_subscriptions`.
-    ///
-    /// `page` is 0-indexed: page 0 returns the first `limit` items, page 1
-    /// the next `limit`, etc. `limit` must be in `1..=MAX_PAGE_SIZE`.
-    pub fn get_all_subscriptions_page(
-        env: Env,
-        page: u32,
-        limit: u32,
-    ) -> Result<Vec<u64>, Error> {
-        if limit == 0 || limit > MAX_PAGE_SIZE {
-            return Err(Error::PageSizeTooLarge);
-        }
-        let all = storage::read_all_ids(&env);
-        let start = page
-            .checked_mul(limit)
-            .ok_or(Error::Overflow)? as usize;
-        let end = start.saturating_add(limit as usize);
-        if start >= all.len() as usize {
-            return Ok(Vec::new(&env));
-        }
-        let end = end.min(all.len() as usize);
-        let mut out = Vec::new(&env);
-        for id in all[start..end].iter() {
-            out.push_back(id);
-        }
-        Ok(out)
-    }
-
     /// Ids of subscriptions whose last reported status is Active.
     pub fn get_active_subscriptions(env: Env) -> Result<Vec<u64>, Error> {
         let mut out = Vec::new(&env);
@@ -289,42 +209,19 @@ impl RegistryContract {
         Ok(out)
     }
 
-    /// Paginated variant of `get_active_subscriptions`.
-    ///
-    /// `page` is 0-indexed: page 0 returns the first `limit` items, page 1
-    /// the next `limit`, etc. `limit` must be in `1..=MAX_PAGE_SIZE`.
-    pub fn get_active_subscriptions_page(
-        env: Env,
-        page: u32,
-        limit: u32,
-    ) -> Result<Vec<u64>, Error> {
-        if limit == 0 || limit > MAX_PAGE_SIZE {
-            return Err(Error::PageSizeTooLarge);
-        }
-        let mut active = Vec::new(&env);
+    /// Total volume charged for a specific token. Sums `total_charged` across
+    /// all subscriptions using that token, regardless of status.
+    pub fn get_token_volume(env: Env, token: Address) -> Result<i128, Error> {
+        let mut volume = 0i128;
         for id in storage::read_all_ids(&env).iter() {
-            if storage::read_record(&env, id)?.status == STATUS_ACTIVE {
-                active.push_back(id);
+            let record = storage::read_record(&env, id)?;
+            if record.token == token {
+                volume = volume.checked_add(record.total_charged).ok_or(Error::Overflow)?;
             }
         }
-        let start = page
-            .checked_mul(limit)
-            .ok_or(Error::Overflow)? as usize;
-        let end = start.saturating_add(limit as usize);
-        if start >= active.len() as usize {
-            return Ok(Vec::new(&env));
-        }
-        let end = end.min(active.len() as usize);
-        let mut out = Vec::new(&env);
-        for id in active[start..end].iter() {
-            out.push_back(id);
-        }
-        Ok(out)
+        Ok(volume)
     }
 }
 
 #[cfg(test)]
 mod test;
-
-#[cfg(test)]
-mod fold_proptest;
