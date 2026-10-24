@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, Address, Option, String};
 
 /// A merchant's reusable billing terms. Subscribers subscribe to a plan and
 /// choose their own cap; `default_cap` is only a suggestion.
@@ -30,4 +30,6 @@ pub struct Plan {
     pub active: bool,
     /// Ledger the plan was created at.
     pub created_at: u32,
+    /// Optional longer description of the plan.
+    pub description: Option<String>,
 }

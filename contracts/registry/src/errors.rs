@@ -32,4 +32,6 @@ pub enum Error {
     Overflow = 11,
     /// That plan id has already been registered.
     PlanAlreadyRegistered = 12,
+    /// Page size exceeds maximum allowed.
+    PageSizeTooLarge = 13,
 }
