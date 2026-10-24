@@ -20,25 +20,19 @@ use interfaces::{PlanClient, RegistryClient};
 use soroban_sdk::{contract, contractimpl, token::TokenClient, Address, Env, Vec};
 use storage::DataKey;
 
-/// Version of this contract's behaviour and storage layout. Bump it on any
-/// change to storage layout or to how an entrypoint behaves, so clients and
-/// indexers can tell which behaviour a deployed contract has.
-pub const VERSION: u32 = 1;
-
 /// Most subscriptions one paged read returns. Larger `limit`s are capped to
 /// this, so a single read stays within the network's resource limits.
 pub const MAX_PAGE_LIMIT: u32 = 50;
+
+/// Most index entries one `due_for_merchant` call reads, whether or not they
+/// are due. Bounds the read cost of a call when few subscriptions are due.
+pub const MAX_SCAN: u32 = 200;
 
 #[contract]
 pub struct SubscriptionContract;
 
 #[contractimpl]
 impl SubscriptionContract {
-    /// The version of the deployed contract. See [`VERSION`].
-    pub fn version(_env: Env) -> u32 {
-        VERSION
-    }
-
     /// Set the admin. Callable once.
     ///
     /// The admin can only link the plan and registry contracts, once each,
@@ -84,17 +78,6 @@ impl SubscriptionContract {
         Ok(())
     }
 
-    /// Transfer admin role to a new address (can be a contract account or multisig).
-    /// Only the current admin can call this.
-    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-        // New admin must authorize the transfer (works for contract accounts and multisigs)
-        new_admin.require_auth();
-        storage::write_admin(&env, &new_admin);
-        storage::bump_instance(&env);
-        Ok(())
-    }
-
     pub fn get_plan_contract(env: Env) -> Option<Address> {
         storage::read_plan_contract(&env)
     }
@@ -121,63 +104,6 @@ impl SubscriptionContract {
         interval_ledgers: u32,
         total_cap: i128,
         plan_id: u64,
-    ) -> Result<u64, Error> {
-        Self::create_subscription(
-            env,
-            subscriber,
-            merchant,
-            token,
-            amount_per_period,
-            interval_ledgers,
-            total_cap,
-            plan_id,
-            0,
-        )
-    }
-
-    /// Same as `subscribe`, with an end ledger. No charge is allowed after
-    /// ledger `expires_at`, so the end only narrows what the merchant may do.
-    /// `expires_at` must be after the current ledger, otherwise
-    /// `InvalidExpiry`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn subscribe_until(
-        env: Env,
-        subscriber: Address,
-        merchant: Address,
-        token: Address,
-        amount_per_period: i128,
-        interval_ledgers: u32,
-        total_cap: i128,
-        plan_id: u64,
-        expires_at: u32,
-    ) -> Result<u64, Error> {
-        if expires_at <= env.ledger().sequence() {
-            return Err(Error::InvalidExpiry);
-        }
-        Self::create_subscription(
-            env,
-            subscriber,
-            merchant,
-            token,
-            amount_per_period,
-            interval_ledgers,
-            total_cap,
-            plan_id,
-            expires_at,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn create_subscription(
-        env: Env,
-        subscriber: Address,
-        merchant: Address,
-        token: Address,
-        amount_per_period: i128,
-        interval_ledgers: u32,
-        total_cap: i128,
-        plan_id: u64,
-        expires_at: u32,
     ) -> Result<u64, Error> {
         storage::read_admin(&env)?;
         subscriber.require_auth();
@@ -221,11 +147,13 @@ impl SubscriptionContract {
             next_charge_ledger: now,
             status: SubStatus::Active,
             plan_id,
-            expires_at,
         };
         storage::write_sub(&env, &sub);
         storage::push_index(&env, DataKey::BySubscriber(sub.subscriber.clone()), id);
         storage::push_index(&env, DataKey::ByMerchant(sub.merchant.clone()), id);
+        if plan_id != 0 {
+            storage::push_index(&env, DataKey::ByPlan(plan_id), id);
+        }
 
         // After the write, so the new subscription's cap is included.
         allowance::sync(&env, &sub.subscriber, &sub.token)?;
@@ -285,9 +213,6 @@ impl SubscriptionContract {
 
         // INTERVAL.
         let now = env.ledger().sequence();
-        if sub.expires_at != 0 && now > sub.expires_at {
-            return Err(Error::SubscriptionExpired);
-        }
         if now < sub.next_charge_ledger {
             return Err(Error::IntervalNotElapsed);
         }
@@ -469,9 +394,6 @@ impl SubscriptionContract {
             return Ok(false);
         }
         let now = env.ledger().sequence();
-        if sub.expires_at != 0 && now > sub.expires_at {
-            return Ok(false);
-        }
         if now < sub.next_charge_ledger || now.checked_add(sub.interval_ledgers).is_none() {
             return Ok(false);
         }
@@ -493,28 +415,94 @@ impl SubscriptionContract {
             .ok_or(Error::Overflow)
     }
 
-    /// Every subscription a subscriber has created, oldest first. Reads the
-    /// whole history, so for subscribers with many subscriptions use
-    /// `get_by_subscriber_page`.
+    /// Every subscription a subscriber has created, oldest first.
     pub fn get_by_subscriber(env: Env, subscriber: Address) -> Result<Vec<Subscription>, Error> {
         Self::load_indexed(&env, &DataKey::BySubscriber(subscriber))
     }
 
-    /// One page of the subscriptions a subscriber has created, oldest first.
+    /// Every subscription payable to a merchant, oldest first. Reads the whole
+    /// history, so for merchants with many subscriptions use
+    /// `get_by_merchant_page`.
+    pub fn get_by_merchant(env: Env, merchant: Address) -> Result<Vec<Subscription>, Error> {
+        Self::load_indexed(&env, &DataKey::ByMerchant(merchant))
+    }
+
+    /// One page of the subscriptions payable to a merchant, oldest first.
     /// `start` is the position of the first item. `limit` is capped at
     /// [`MAX_PAGE_LIMIT`]. A page past the end is empty.
-    pub fn get_by_subscriber_page(
+    pub fn get_by_merchant_page(
         env: Env,
-        subscriber: Address,
+        merchant: Address,
         start: u32,
         limit: u32,
     ) -> Result<Vec<Subscription>, Error> {
-        Self::load_page(&env, &DataKey::BySubscriber(subscriber), start, limit)
+        Self::load_page(&env, &DataKey::ByMerchant(merchant), start, limit)
     }
 
-    /// Every subscription payable to a merchant, oldest first.
-    pub fn get_by_merchant(env: Env, merchant: Address) -> Result<Vec<Subscription>, Error> {
-        Self::load_indexed(&env, &DataKey::ByMerchant(merchant))
+    /// How many subscriptions a subscriber has created. Reads only the index,
+    /// not the records.
+    pub fn count_by_subscriber(env: Env, subscriber: Address) -> u32 {
+        storage::read_index(&env, &DataKey::BySubscriber(subscriber)).len()
+    }
+
+    /// How many subscriptions are payable to a merchant. Reads only the index,
+    /// not the records.
+    pub fn count_by_merchant(env: Env, merchant: Address) -> u32 {
+        storage::read_index(&env, &DataKey::ByMerchant(merchant)).len()
+    }
+
+    /// One page of the subscriptions created from a plan, oldest first. `start`
+    /// and `limit` work as in `get_by_merchant_page`. Ad-hoc subscriptions
+    /// (plan id 0) are never listed here.
+    pub fn get_by_plan_page(
+        env: Env,
+        plan_id: u64,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<Subscription>, Error> {
+        Self::load_page(&env, &DataKey::ByPlan(plan_id), start, limit)
+    }
+
+    /// How many subscriptions were created from a plan. Reads only the index.
+    pub fn count_by_plan(env: Env, plan_id: u64) -> u32 {
+        storage::read_index(&env, &DataKey::ByPlan(plan_id)).len()
+    }
+
+    /// Ids of the merchant's subscriptions that `is_chargeable` reports as due
+    /// now, read from the merchant's index starting at position `start`.
+    ///
+    /// Returns the due ids found and the position to resume from, or `None`
+    /// once the index is exhausted. One call reads at most `MAX_SCAN` index
+    /// entries, so it can return fewer than `limit` ids while more remain.
+    /// Keep calling with the returned position until it is `None`. The result
+    /// is a snapshot, so a `charge` on a returned id can still fail. `limit` is
+    /// clamped to between 1 and `MAX_PAGE_LIMIT`.
+    pub fn due_for_merchant(
+        env: Env,
+        merchant: Address,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<u64>, Option<u32>) {
+        let ids = storage::read_index(&env, &DataKey::ByMerchant(merchant));
+        let limit = limit.clamp(1, MAX_PAGE_LIMIT);
+        let mut due = Vec::new(&env);
+        let mut position = start;
+        let mut scanned: u32 = 0;
+        while position < ids.len() && scanned < MAX_SCAN && due.len() < limit {
+            if let Some(id) = ids.get(position) {
+                if Self::is_chargeable(env.clone(), id).unwrap_or(false) {
+                    due.push_back(id);
+                }
+            }
+            position += 1;
+            scanned += 1;
+        }
+        let next = if position < ids.len() {
+            Some(position)
+        } else {
+            None
+        };
+        (due, next)
     }
 
     // ---- internal helpers ----
@@ -588,6 +576,7 @@ impl SubscriptionContract {
         Ok(())
     }
 
+    /// Reads one page of an index. Only the records in the page are loaded.
     fn load_page(env: &Env, key: &DataKey, start: u32, limit: u32) -> Result<Vec<Subscription>, Error> {
         let ids = storage::read_index(env, key);
         let end = start
