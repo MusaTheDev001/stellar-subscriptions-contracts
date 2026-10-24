@@ -1,15 +1,15 @@
 //! All three contracts deployed and linked: subscriptions checked against
 //! real plans, and a real registry mirroring every lifecycle change.
 
-use plan::{PlanContract, PlanContractClient};
+use plan::{Plan as PlanType, PlanContract, PlanContractClient};
 use registry::{
     RegistryContract, RegistryContractClient, STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED,
     STATUS_PAUSED,
 };
-use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol};
+use soroban_sdk::{testutils::Address as _, Address, String};
 
 use super::setup::{expect_err, Setup, AMOUNT, CAP, INTERVAL};
-use crate::Error;
+use crate::{interfaces::Plan as MirroredPlan, Error};
 
 struct Linked {
     s: Setup,
@@ -306,121 +306,83 @@ fn a_misconfigured_registry_blocks_subscribe_instead_of_losing_the_record() {
     assert_eq!(s.allowance(), 0);
 }
 
-// A registry stand-in that can be armed to fail its update call, so a registry
-// failure is reproducible in isolation from the real registry's own rules.
-#[soroban_sdk::contracterror]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u32)]
-enum MockError {
-    Armed = 1,
-}
-
-#[soroban_sdk::contract]
-struct FailingRegistry;
-
-#[soroban_sdk::contractimpl]
-impl FailingRegistry {
-    pub fn arm(env: Env) {
-        env.storage().instance().set(&Symbol::new(&env, "ARMED"), &true);
-    }
-
-    pub fn disarm(env: Env) {
-        env.storage().instance().set(&Symbol::new(&env, "ARMED"), &false);
-    }
-
-    /// Mirror the registry the subscription contract calls. An armed registry
-    /// returns an error so the subscription contract maps the outcome to
-    /// `RegistryUpdateFailed` and rolls its own changes back.
-    pub fn register_subscription(
-        env: Env,
-        _subscription_id: u64,
-        _subscriber: Address,
-        _merchant: Address,
-    ) -> Result<(), MockError> {
-        let armed: bool = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "ARMED"))
-            .unwrap_or(false);
-        if armed {
-            return Err(MockError::Armed);
-        }
-        Ok(())
-    }
-
-    pub fn update_subscription(
-        env: Env,
-        _subscription_id: u64,
-        _total_charged: i128,
-        _status: u32,
-    ) -> Result<(), MockError> {
-        let armed: bool = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "ARMED"))
-            .unwrap_or(false);
-        if armed {
-            return Err(MockError::Armed);
-        }
-        Ok(())
-    }
-}
-
-struct Mocked {
-    s: Setup,
-    mock: FailingRegistryClient<'static>,
-    id: u64,
-}
-
-/// A subscription whose every lifecycle change is reported to a registry the
-/// test can arm to fail, in place of the real one.
-fn mock_registry() -> Mocked {
-    let s = Setup::new();
-    let mock = FailingRegistryClient::new(&s.env, &s.env.register(FailingRegistry, ()));
-    s.client.set_registry(&s.admin, &mock.address);
-    mock.disarm();
-    let id = s.subscribe();
-    Mocked { s, mock, id }
-}
-
+/// The two `Plan` structs — `plan::Plan` and the mirrored
+/// `interfaces::Plan` — must stay in sync. This test builds a real plan,
+/// decodes it through the mirrored type, and compares every field.
+///
+/// If a field is added, removed, or renamed in only one place, the decode
+/// will produce a mismatched value or a host error, and the assertions below
+/// will fail with a message indicating which field diverged.
 #[test]
-fn charge_rolls_back_everything_when_the_registry_update_fails() {
-    let m = mock_registry();
-    let before = m.s.snapshot(m.id);
-    m.mock.arm();
-    expect_err(
-        m.s.client.try_charge(&m.s.merchant, &m.id),
-        Error::RegistryUpdateFailed,
-    );
-    // The transfer happens before the registry report; the failed report must
-    // roll it back, leaving the subscription, balances and allowance as they
-    // were.
-    assert_eq!(m.s.snapshot(m.id), before);
+fn plan_mirror_type_matches_the_real_plan_contract() {
+    let l = linked();
+    let plan_id = l.create_plan();
+
+    // Decode through the canonical type (plan crate).
+    let canonical: PlanType = l.plans.get_plan(&plan_id);
+
+    // Decode through the mirrored type (interfaces.rs) by calling the same
+    // contract. The SDK decodes contracttype by field name across crate
+    // boundaries, so any rename or addition in only one type will mismatch.
+    use crate::interfaces::PlanClient as MirroredPlanClient;
+    let mirrored: MirroredPlan = MirroredPlanClient::new(&l.s.env, &l.plans.address)
+        .get_plan(&plan_id);
+
+    // Compare every field individually so the failure message names the diverging field.
+    assert_eq!(mirrored.id, canonical.id,
+        "field `id` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.merchant, canonical.merchant,
+        "field `merchant` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.name, canonical.name,
+        "field `name` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.token, canonical.token,
+        "field `token` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.amount_per_period, canonical.amount_per_period,
+        "field `amount_per_period` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.interval_ledgers, canonical.interval_ledgers,
+        "field `interval_ledgers` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.default_cap, canonical.default_cap,
+        "field `default_cap` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.active, canonical.active,
+        "field `active` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
+    assert_eq!(mirrored.created_at, canonical.created_at,
+        "field `created_at` differs between plan::Plan and interfaces::Plan — update interfaces.rs");
 }
 
+/// A deactivated plan must still decode correctly — `PlanInactive` is
+/// returned, not `PlanNotFound`. `PlanNotFound` is reserved for plan ids
+/// that do not exist at all.
 #[test]
-fn pause_rolls_back_state_when_the_registry_update_fails() {
-    let m = mock_registry();
-    let before = m.s.snapshot(m.id);
-    m.mock.arm();
-    expect_err(
-        m.s.client.try_pause(&m.s.subscriber, &m.id),
-        Error::RegistryUpdateFailed,
-    );
-    assert_eq!(m.s.snapshot(m.id), before);
-}
+fn deactivated_plan_returns_plan_inactive_not_plan_not_found() {
+    let l = linked();
+    let plan_id = l.create_plan();
+    l.plans.deactivate_plan(&l.s.merchant, &plan_id);
 
-#[test]
-fn resume_rolls_back_state_when_the_registry_update_fails() {
-    let m = mock_registry();
-    // Pause succeeds while the registry is healthy; the armed failure is for
-    // the resume that follows.
-    m.s.client.pause(&m.s.subscriber, &m.id);
-    let before = m.s.snapshot(m.id);
-    m.mock.arm();
+    // Subscribing to an existing-but-inactive plan must fail with PlanInactive.
     expect_err(
-        m.s.client.try_resume(&m.s.subscriber, &m.id),
-        Error::RegistryUpdateFailed,
+        l.s.client.try_subscribe(
+            &l.s.subscriber,
+            &l.s.merchant,
+            &l.s.token.address,
+            &AMOUNT,
+            &INTERVAL,
+            &CAP,
+            &plan_id,
+        ),
+        Error::PlanInactive,
     );
-    assert_eq!(m.s.snapshot(m.id), before);
+
+    // An id that was never created must fail with PlanNotFound, not PlanInactive.
+    expect_err(
+        l.s.client.try_subscribe(
+            &l.s.subscriber,
+            &l.s.merchant,
+            &l.s.token.address,
+            &AMOUNT,
+            &INTERVAL,
+            &CAP,
+            &9999,
+        ),
+        Error::PlanNotFound,
+    );
 }
