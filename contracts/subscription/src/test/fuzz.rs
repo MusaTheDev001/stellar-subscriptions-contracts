@@ -79,7 +79,11 @@ fn attach_registry(s: &Setup) -> RegistryContractClient<'static> {
 // ── proptest 1: single subscription + registry mirror ────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: fuzz_cases(), ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: fuzz_cases(),
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::WithSource("regressions"))),
+        ..ProptestConfig::default()
+    })]
 
     /// CAP, INTERVAL and REVOCATION must hold after every step, and the
     /// registry's aggregate counters must match the values derived from the
